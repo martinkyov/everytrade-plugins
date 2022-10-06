@@ -350,6 +350,11 @@ public class EverytradeCsvMultiParser implements ICsvParser {
                     CsvHeader.of(
                         "ID", "Datum", "Typ", "Částka", "Částka měny", "Cena", "Cena měny", "Poplatek", "Poplatek měny", "Celkem",
                         "Celkem měny", "Popisek", "Status"
+                    ).withSeparator(delimiter),
+                    CsvHeader.of(
+                        "ID", "Datum", "Typ", "Částka", "Částka měny", "Cena", "Cena měny", "Poplatek", "Poplatek měny", "Celkem",
+                        "Celkem měny", "Popisek", "Status", "První zůstatek po", "První zůstatek po měně", "Druhý zůstatek po",
+                        "Druhý zůstatek po měně"
                     ).withSeparator(delimiter)
                 ))
                 .parserFactory(() -> new DefaultUnivocityExchangeSpecificParser(CoinmateBeanV1.class, delimiter))
