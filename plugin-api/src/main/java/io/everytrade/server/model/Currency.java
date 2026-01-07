@@ -998,7 +998,11 @@ public enum Currency {
     SMH(false, Instant.parse("2023-08-31T00:00:00Z"), "Spacemesh"),
     SAHARA(false, Instant.parse("2025-06-26T00:00:00Z"), "Sahara AI"),
     SKI(false, Instant.parse("2024-04-18T00:00:00Z"), "Ski Mask Dog"),
-    ASTER(false, Instant.parse("2025-09-19T00:00:00Z"), "Aster");
+    ASTER(false, Instant.parse("2025-09-19T00:00:00Z"), "Aster"),
+    WFI(false, Instant.parse("2025-11-20T00:00:00Z"), "WeFi"),
+    BERA(false, Instant.parse("2025-02-06T00:00:00Z"), "Berachain"),
+    NIGHT(false, Instant.parse("2025-12-09T00:00:00Z"), "Midnight"),
+    AIA(false, Instant.parse("2025-09-18T00:00:00Z"), "DeAgent (AIA)");
 
     String code;
     int decimalDigits;
