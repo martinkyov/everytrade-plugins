@@ -56,7 +56,8 @@ public enum SupportedExchange {
     DASE("DASE", "dase"),
     INVITY_FINANCE("Invity Finance", "invityfinance"),
     REVOLUT("Revolut", "revolut"),
-    BYBIT_EU("ByBit EU", "bybiteu");
+    BYBIT_EU("ByBit EU", "bybiteu"),
+    SRAJTOFLE("Srajtofle", "srajtofle");
 
     String displayName;
     String internalId;

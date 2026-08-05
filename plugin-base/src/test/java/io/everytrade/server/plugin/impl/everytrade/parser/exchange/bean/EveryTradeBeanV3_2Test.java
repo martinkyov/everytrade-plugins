@@ -917,4 +917,112 @@ class EveryTradeBeanV3_2Test {
         ParserTestUtils.checkEqual(expected, actual);
     }
 
+    // =============================================================================================
+    // ETD-2182 -- zero-cost-gain valuation survives the WhaleBooks export -> import round trip.
+    //
+    // The rows below are the VERBATIM output of the host's TransactionExporter (FormatType.WHALEBOOKS)
+    // for the linked-portfolios fixture portfolio -9010, which contains every transaction type. Keeping
+    // the real bytes here pins both halves of the round trip: if the exporter changes shape, these
+    // assertions are what tells us the importer no longer reads it.
+    // =============================================================================================
+
+    private static final String EXPORTED_ROWS =
+        "-90002;02.01.2022 00:00:00;BTC;DEPOSIT;0,9999;;;;;;;;;;\n"
+        + "-90000;01.06.2022 00:00:00;BTC/CZK;BUY;1;750000;750000;0,123;BTC;;;;;;\n"
+        + "-90003;01.06.2022 00:00:01;BTC/CZK;STAKE REWARD;1,4;702181,67035711097;983054,338499955358;;;;;;;;\n"
+        + "-90004;01.06.2022 00:00:02;BTC/CZK;AIRDROP;1,3;702181,67035711097;912836,171464244261;;;;;;;;\n"
+        + "-90005;01.06.2022 00:00:03;BTC/CZK;EARN;1,2;702181,67035711097;842618,004428533164;;;;;;;;\n"
+        + "-90006;01.06.2022 00:00:04;BTC/CZK;FORK;1,1;702181,67035711097;772399,837392822067;;;;;;;;\n"
+        + "-90007;04.06.2022 00:00:00;BTC/CZK;SELL;0,2;1400000;280000;0,0234;BTC;;;;;;\n"
+        + "-90009;05.06.2022 00:00:00;BTC/CZK;SELL;0,01;1600000;16000;200;CZK;;;;;;\n"
+        + "-90011;12.06.2022 00:00:00;BTC;WITHDRAWAL;0,088;;;;;;;;;;\n"
+        + "-90012;01.07.2022 00:00:00;BTC/CZK;BUY;1,5;1500000;2250000;150;CZK;;;;;;\n"
+        + "-90014;29.07.2022 00:00:00;BTC;STAKE;0,5;;;;;;;;;;\n"
+        + "-90015;07.08.2022 00:00:00;BTC/CZK;REWARD;1,7;554950,4044588234;943415,68757999978;;;;;;;;\n"
+        + "-90016;01.10.2022 00:00:00;BTC;UNSTAKE;0,1;;;;;;;;;;\n";
+
+    @Test
+    void exportedRewardRowsKeepQuoteCurrencyAndPrice() {
+        final var clusters = ParserTestUtils.getTransactionClusters(HEADER_V3_3 + EXPORTED_ROWS);
+        final var byUid = clusters.stream().collect(java.util.stream.Collectors.toMap(c -> c.getMain().getUid(), c -> c));
+
+        assertEquals(13, clusters.size(), "every exported row must come back");
+
+        // the five zero-cost-gain types carried a CZK acquisition value -- it must survive
+        for (String uid : List.of("-90003", "-90004", "-90005", "-90006")) {
+            final var tx = byUid.get(uid).getMain();
+            assertEquals(BTC, tx.getBase(), uid);
+            assertEquals(CZK, tx.getQuote(), uid + " quote currency must not collapse to the base");
+            assertEquals(0, new BigDecimal("702181.67035711097").compareTo(tx.getUnitPrice()),
+                uid + " acquisition price must survive, got " + tx.getUnitPrice());
+        }
+
+        final var reward = byUid.get("-90015").getMain();
+        assertEquals(REWARD, reward.getAction());
+        assertEquals(CZK, reward.getQuote());
+        assertEquals(0, new BigDecimal("554950.4044588234").compareTo(reward.getUnitPrice()));
+        assertEquals(0, new BigDecimal("943415.68757999978").compareTo(reward.getQuoteVolume()));
+
+        assertEquals(STAKING_REWARD, byUid.get("-90003").getMain().getAction(), "\"STAKE REWARD\" alias");
+        assertEquals(AIRDROP, byUid.get("-90004").getMain().getAction());
+        assertEquals(EARNING, byUid.get("-90005").getMain().getAction(), "\"EARN\" alias");
+        assertEquals(FORK, byUid.get("-90006").getMain().getAction());
+    }
+
+    /**
+     * STAKE / UNSTAKE are transfers between spot and staked, not valued acquisitions -- they keep the
+     * pre-ETD-2182 shape (quote == base, no price) so the accounting engine is unaffected.
+     */
+    @Test
+    void exportedStakeAndUnstakeStayUnvalued() {
+        final var clusters = ParserTestUtils.getTransactionClusters(HEADER_V3_3 + EXPORTED_ROWS);
+        final var byUid = clusters.stream().collect(java.util.stream.Collectors.toMap(c -> c.getMain().getUid(), c -> c));
+
+        for (String uid : List.of("-90014", "-90016")) {
+            final var tx = byUid.get(uid).getMain();
+            assertEquals(BTC, tx.getBase(), uid);
+            assertEquals(BTC, tx.getQuote(), uid + " must stay base/base");
+            assertNull(tx.getUnitPrice(), uid + " must stay price-less");
+        }
+    }
+
+    /**
+     * A zero-cost-gain row written the old way (bare base symbol, no price) must keep working.
+     */
+    @Test
+    void bareSymbolRewardRowRemainsUnvalued() {
+        final String row = "-90015;07.08.2022 00:00:00;BTC;REWARD;1,7;;;;;;;;;;\n";
+        final var cluster = ParserTestUtils.getTransactionCluster(HEADER_V3_3 + row);
+
+        assertEquals(BTC, cluster.getMain().getBase());
+        assertEquals(BTC, cluster.getMain().getQuote());
+        assertNull(cluster.getMain().getUnitPrice());
+    }
+
+    @Test
+    void exportedTradesAndTransfersRoundTrip() {
+        final var clusters = ParserTestUtils.getTransactionClusters(HEADER_V3_3 + EXPORTED_ROWS);
+        final var byUid = clusters.stream().collect(java.util.stream.Collectors.toMap(c -> c.getMain().getUid(), c -> c));
+
+        // BUY with a fee in the BASE currency
+        final var buy = byUid.get("-90000");
+        assertEquals(BUY, buy.getMain().getAction());
+        assertEquals(0, new BigDecimal("750000").compareTo(buy.getMain().getUnitPrice()));
+        assertEquals(1, buy.getRelated().size());
+        assertEquals(BTC, buy.getRelated().get(0).getBase(), "fee currency BTC");
+        assertEquals(0, new BigDecimal("0.123").compareTo(buy.getRelated().get(0).getVolume()));
+
+        // SELL with a fee in the QUOTE currency
+        final var sell = byUid.get("-90009");
+        assertEquals(SELL, sell.getMain().getAction());
+        assertEquals(1, sell.getRelated().size());
+        assertEquals(CZK, sell.getRelated().get(0).getBase(), "fee currency CZK");
+        assertEquals(0, new BigDecimal("200").compareTo(sell.getRelated().get(0).getVolume()));
+
+        // DEPOSIT / WITHDRAWAL keep base == quote and no price
+        for (String uid : List.of("-90002", "-90011")) {
+            assertNull(byUid.get(uid).getMain().getUnitPrice(), uid);
+            assertEquals(BTC, byUid.get(uid).getMain().getQuote(), uid);
+        }
+    }
 }

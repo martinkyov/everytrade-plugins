@@ -109,6 +109,7 @@ import io.everytrade.server.plugin.impl.everytrade.parser.exchange.okx.OkxExchan
 import io.everytrade.server.plugin.impl.everytrade.parser.exchange.okx.OkxExchangeSpecificParserV2;
 import io.everytrade.server.plugin.impl.everytrade.parser.exchange.okx.OkxWdrlDepExchangeSpecificParser;
 import io.everytrade.server.plugin.impl.everytrade.parser.exchange.simplecoin.SimplecoinBeanV2;
+import io.everytrade.server.plugin.impl.everytrade.parser.exchange.srajtofle.SrajtofleBeanV1;
 import io.everytrade.server.plugin.impl.everytrade.parser.exchange.trezorSuite.TrezorSuiteBeanV1;
 import io.everytrade.server.plugin.impl.everytrade.parser.exchange.trezorSuite.TrezorSuiteExchangeSpecificParser;
 import io.everytrade.server.plugin.impl.everytrade.parser.utils.ClusterValidator;
@@ -167,6 +168,7 @@ import static io.everytrade.server.model.SupportedExchange.POLONIEX;
 import static io.everytrade.server.model.SupportedExchange.REVOLUT;
 import static io.everytrade.server.model.SupportedExchange.SHAKEPAY;
 import static io.everytrade.server.model.SupportedExchange.SIMPLECOIN;
+import static io.everytrade.server.model.SupportedExchange.SRAJTOFLE;
 import static io.everytrade.server.model.SupportedExchange.TREZOR_SUITE;
 import static io.everytrade.server.model.SupportedExchange.WALLET_OF_SATOSHI;
 import static io.everytrade.server.plugin.api.parser.ParsingProblemType.PARSED_ROW_IGNORED;
@@ -1271,6 +1273,28 @@ public class EverytradeCsvMultiParser implements ICsvParser {
                         .withSeparator(delimiter)))
                 .parserFactory(() -> new DefaultUnivocityExchangeSpecificParser(EveryTradeBeanV1.class, delimiter))
                 .supportedExchange(EVERYTRADE)
+                .build());
+        });
+
+        /*
+         * SRAJTOFLE
+         *
+         * The WhaleBooks export header minus UNIT_PRICE and VOLUME_QUOTE. That makes this template a
+         * strict subset of the WhaleBooks one, and CsvHeader matching is subset-based -- so a real
+         * WhaleBooks file matches both templates. findCsvDetailByHeader() and
+         * ParserDescriptor.findHeaderTemplate() both resolve ties by the highest column count, so the
+         * 15-column WhaleBooks template still wins for WhaleBooks files and only a genuinely
+         * price-less 13-column file lands here.
+         */
+        DELIMITERS.forEach(delimiter -> {
+            EXCHANGE_PARSE_DETAILS.add(ExchangeParseDetail.builder()
+                .headers(List.of(
+                    CsvHeader.of(
+                        "UID", "DATE", "SYMBOL", "ACTION", "QUANTITY", "FEE", "FEE_CURRENCY",
+                        "ADDRESS_FROM", "ADDRESS_TO", "NOTE", "LABELS", "PARTNER", "REFERENCE"
+                    ).withSeparator(delimiter)))
+                .parserFactory(() -> new DefaultUnivocityExchangeSpecificParser(SrajtofleBeanV1.class, delimiter))
+                .supportedExchange(SRAJTOFLE)
                 .build());
         });
 
