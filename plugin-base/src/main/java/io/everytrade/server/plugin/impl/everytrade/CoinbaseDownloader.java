@@ -28,7 +28,7 @@ import org.knowm.xchange.service.account.AccountService;
 import org.knowm.xchange.service.trade.TradeService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import si.mazi.rescu.HttpStatusIOException;
+import si.mazi.rescu.HttpStatusException;
 
 import java.io.IOException;
 import java.math.BigDecimal;
@@ -105,33 +105,46 @@ public class CoinbaseDownloader {
         List<UserTrade> advancedTrading = new ArrayList<>();
         List<ParsingProblem> parsingProblems = new ArrayList<>();
 
+        // ETD-2150: the returned resume state must describe exactly the transactions in the returned parse result.
+        // Both sections below advance the resume state as they go, but throw away everything they accumulated when
+        // they fail: downloadTrades mutates walletStates in place per wallet and then discards its whole result list,
+        // and downloadAdvancedTrade does the same with the cursor/timestamp fields. Handing back an advanced watermark
+        // for data this run never delivered hides those transactions from every later sync - permanently, and with the
+        // host still recording the synchronization as successful. So each section's pre-download state is captured here
+        // and restored if that section fails.
+        final String advancedTradeStateBeforeDownload = advancedTradeLastDownloadTimestamp();
+        final String walletsStateBeforeDownload = walletsState(walletStates);
+
 //      Advance Trades are not supported by the current version of the plugin - needs its own connector
+        boolean advancedTradeFailed = false;
         try {
             LOG.info("Advanced trading download start");
             advancedTrading = downloadAdvancedTrade(parsingProblems);
         } catch (Exception e) {
             LOG.error("Advanced trading download error " + e.getMessage());
+            advancedTradeFailed = true;
         }
 
+        boolean tradesFailed = false;
         try {
             LOG.info("Trades download start");
             trades = downloadTrades(walletStates);
         } catch (Exception e) {
             LOG.error("Trades download error " + e.getMessage());
+            tradesFailed = true;
         }
 
-        try {
-            LOG.info("Funding download start");
-//            funding = downloadFunding(walletStates); TODO: uncomment when coinbase fix their pagination
-        } catch (Exception e) {
-            LOG.error("Funding download error " + e.getMessage());
-        }
+//      funding = downloadFunding(walletStates); TODO: uncomment when coinbase fix their pagination
+//      Deposits and withdrawals currently arrive through the v2 transactions endpoint in downloadTrades instead;
+//      calling downloadFunding as well produced duplicates (ETD-1475). When re-enabling it, give it the same
+//      capture/restore treatment as the sections above - it mutates walletStates too.
 
-        DownloadResult build = DownloadResult.builder()
-            .parseResult(new XChangeConnectorParser().getCoinbaseParseResult(advancedTrading, trades,funding, parsingProblems))
-            .downloadStateData(getLastTransactionId(walletStates))
+        return DownloadResult.builder()
+            .parseResult(new XChangeConnectorParser().getCoinbaseParseResult(advancedTrading, trades, funding, parsingProblems))
+            .downloadStateData(resumeState(
+                tradesFailed ? walletsStateBeforeDownload : walletsState(walletStates),
+                advancedTradeFailed ? advancedTradeStateBeforeDownload : advancedTradeLastDownloadTimestamp()))
             .build();
-        return build;
     }
 
     private CoinbaseTradeHistoryParams setParamsBeforeStart(TradeService tradeService, Instant now) {
@@ -184,6 +197,13 @@ public class CoinbaseDownloader {
     private List<UserTrade> downloadAdvancedTrade(List<ParsingProblem> parsingProblems) {
         var tradeService = exchange.getTradeService();
         Instant now = Instant.now();
+        // ETD-2150: the 403 branch below abandons the drain and returns an empty list, discarding every fill collected
+        // so far - but the paging fields have already advanced past them. Unlike the throwing branch, that early return
+        // is invisible to the caller, so the entry state is captured here and restored before returning empty.
+        final long entryPartialStartDatetime = partialLastAdvanceTradeStartDatetime;
+        final long entryPartialEndDatetime = partialLastAdvanceTradeEndDatetime;
+        final long entryCompletedEndDatetime = completedLastAdvanceTradeEndDatetime;
+        final String entryCursor = cursorAdvanceTrade;
         if (completedLastAdvanceTradeEndDatetime == 0) {
             completedLastAdvanceTradeEndDatetime = now.toEpochMilli();
         }
@@ -209,7 +229,12 @@ public class CoinbaseDownloader {
                 advancedTradesBlock = advancedTradeOrderFillsRow.getFills();
                 cursorAdvanceTrade = advancedTradeOrderFillsRow.getCursor();
             } catch (Exception e) {
-                if (e.getMessage().equalsIgnoreCase("HTTP status code was not OK: 403")) {
+                // Null-safe: without the guard a message-less exception NPEs here instead of being classified.
+                if ("HTTP status code was not OK: 403".equalsIgnoreCase(e.getMessage())) {
+                    partialLastAdvanceTradeStartDatetime = entryPartialStartDatetime;
+                    partialLastAdvanceTradeEndDatetime = entryPartialEndDatetime;
+                    completedLastAdvanceTradeEndDatetime = entryCompletedEndDatetime;
+                    cursorAdvanceTrade = entryCursor;
                     return new ArrayList<>();
                 } else {
                     throw new IllegalStateException("Unable to download advanced trades. ", e);
@@ -435,8 +460,17 @@ public class CoinbaseDownloader {
         return fundingRecords;
     }
 
-    private String getLastTransactionId(Map<String, WalletState> walletStates) {
-        String walletsState = walletStates.entrySet().stream()
+    /**
+     * Joins the two independent halves of the resume blob. They are kept separate so that a section which failed can
+     * contribute its pre-download half while the section that succeeded contributes its advanced one (ETD-2150).
+     */
+    private static String resumeState(String walletsState, String advancedTradeState) {
+        return walletsState + ADVANCED_TRADE_SYMBOL_SEPARATOR + advancedTradeState;
+    }
+
+    /** Serializes the per-wallet resume watermarks - the half of the resume blob owned by {@link #downloadTrades}. */
+    private String walletsState(Map<String, WalletState> walletStates) {
+        return walletStates.entrySet().stream()
             .filter(entry -> entry.getValue().lastBuyId != null ||
                 entry.getValue().lastSellId != null ||
                 entry.getValue().lastDepositId != null ||
@@ -460,7 +494,6 @@ public class CoinbaseDownloader {
                     + Objects.requireNonNullElse(entry.getValue().lastFundingWalletUpdate, DASH_SYMBOL)
             )
             .collect(Collectors.joining(PIPE_SYMBOL));
-        return walletsState + ADVANCED_TRADE_SYMBOL_SEPARATOR + advancedTradeLastDownloadTimestamp();
     }
 
     private Map<String, WalletState> walletStates(String downloadState) {
@@ -520,15 +553,31 @@ public class CoinbaseDownloader {
                 .stream()
                 .filter(s -> s.length() == REAL_WALLET_ID_LENGTH)
                 .collect(Collectors.toSet());
-        } catch (IOException e) {
+        } catch (Exception e) {
             // A 401 means the user's API key is invalid, expired, or revoked - the whole sync can never
             // succeed until they re-authorize. Surface an actionable message (the host shows it as the
             // connection's error description) instead of the generic "Wallets download failed.", which
             // is indistinguishable from a transient outage and just repeats on every scheduled retry.
+            //
+            // ETD-2150: this used to catch IOException only, which never fired. Measured against a live account with
+            // a foreign CDP key id, the rejection arrives as RuntimeException wrapping HttpStatusIOException 401, and
+            // a parseable Coinbase error body arrives as CoinbaseException - a RuntimeException as well. Both are
+            // invisible to an IOException catch, so the classification below was unreachable for exactly the failure
+            // the ticket is about.
             if (httpStatusOf(e) == HTTP_UNAUTHORIZED) {
                 throw new IllegalStateException(
                     "Coinbase authorization failed (HTTP 401): the API key is invalid, expired, or has been "
                         + "revoked. Please reconnect your Coinbase account with a valid API key.", e);
+            }
+            if (isSecretParsingFailure(e)) {
+                throw new IllegalStateException(
+                    "Coinbase request could not be signed: the API secret is not a valid EC private key in PEM "
+                        + "format. Re-copy the private key from Coinbase, including the BEGIN/END lines.", e);
+            }
+            // Everything else keeps its previous shape: unchecked exceptions propagate untouched (wrapping them would
+            // bury messages such as "Failed to generate JWT"), checked ones keep the historical wrapper.
+            if (e instanceof RuntimeException runtimeException) {
+                throw runtimeException;
             }
             throw new IllegalStateException("Wallets download failed.", e);
         }
@@ -536,12 +585,34 @@ public class CoinbaseDownloader {
 
     /**
      * Returns the HTTP status code that caused {@code t}, or -1 if it was not an HTTP error. Coinbase
-     * REST errors reach us through xchange as a rescu {@link HttpStatusIOException}; it can sit a few
-     * levels down the cause chain, so the whole chain is walked.
+     * REST errors reach us through xchange as a rescu {@link HttpStatusException} - either the checked
+     * {@code HttpStatusIOException} or, when Coinbase returns a parseable error body, the unchecked
+     * {@code CoinbaseException}. Matching the interface covers both; matching the concrete
+     * {@code HttpStatusIOException} missed every unchecked one. It can sit a few levels down the cause chain
+     * (a 401 arrives wrapped in a plain RuntimeException), so the whole chain is walked.
      */
+    /**
+     * True when the cause chain shows the API secret could not be parsed as a PEM EC private key, i.e. the CDP signer
+     * failed locally and no request ever left the process. That surfaces as a bare
+     * {@code RuntimeException("Failed to generate JWT")}, which tells the user nothing they can act on.
+     * <p>
+     * Matched by class name on purpose: bouncycastle is only a transitive runtime dependency of the xchange stack and
+     * is not on this module's compile classpath, so it cannot be referenced with {@code instanceof} without adding a
+     * declared dependency. A class name is still a far more stable signal than the exception message, and the
+     * behaviour is pinned by {@code CoinbaseApiTxDownloaderIT#aMalformedApiSecretMustSurfaceAnActionableCredentialError}.
+     */
+    private static boolean isSecretParsingFailure(Throwable t) {
+        for (Throwable c = t; c != null && c != c.getCause(); c = c.getCause()) {
+            if (c.getClass().getName().startsWith("org.bouncycastle.openssl.PEM")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static int httpStatusOf(Throwable t) {
         for (Throwable c = t; c != null && c != c.getCause(); c = c.getCause()) {
-            if (c instanceof HttpStatusIOException httpEx) {
+            if (c instanceof HttpStatusException httpEx) {
                 return httpEx.getHttpStatusCode();
             }
         }
