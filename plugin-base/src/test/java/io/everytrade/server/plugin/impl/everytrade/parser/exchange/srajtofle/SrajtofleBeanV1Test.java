@@ -27,12 +27,16 @@ import static io.everytrade.server.model.TransactionType.STAKE;
 import static io.everytrade.server.model.TransactionType.STAKING_REWARD;
 import static io.everytrade.server.model.TransactionType.UNSTAKE;
 import static io.everytrade.server.model.TransactionType.WITHDRAWAL;
+import static io.everytrade.server.plugin.impl.everytrade.parser.exchange.ExchangeBean.FEE_UID_PART;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The Srajtofle format is the WhaleBooks export without UNIT_PRICE and VOLUME_QUOTE.
+ * The Srajtofle format is the WhaleBooks export without UNIT_PRICE and VOLUME_QUOTE. It ships in
+ * two widths - the full 13-column one and the 9-column one that also drops the trailing metadata
+ * columns (ETD-2200) - and both are served by the same bean.
  *
  * @see SrajtofleBeanV1
  */
@@ -44,9 +48,22 @@ class SrajtofleBeanV1Test {
     private static final String HEADER_COMMA_SEPARATED =
         "UID,DATE,SYMBOL,ACTION,QUANTITY,FEE,FEE_CURRENCY,ADDRESS_FROM,ADDRESS_TO,NOTE,LABELS,PARTNER,REFERENCE\n";
 
+    /**
+     * The 9-column variant: no NOTE, LABELS, PARTNER or REFERENCE column at all.
+     */
+    private static final String HEADER_9_COLUMNS =
+        "UID;DATE;SYMBOL;ACTION;QUANTITY;FEE;FEE_CURRENCY;ADDRESS_FROM;ADDRESS_TO\n";
+
+    private static final String HEADER_9_COLUMNS_COMMA_SEPARATED =
+        "UID,DATE,SYMBOL,ACTION,QUANTITY,FEE,FEE_CURRENCY,ADDRESS_FROM,ADDRESS_TO\n";
+
     private static final String WHALEBOOKS_HEADER =
         "UID;DATE;SYMBOL;ACTION;QUANTITY;UNIT_PRICE;VOLUME_QUOTE;FEE;FEE_CURRENCY;ADDRESS_FROM;ADDRESS_TO;NOTE;LABELS;"
             + "PARTNER;REFERENCE";
+
+    /** Synthetic, deliberately checksum-invalid addresses - never a real one from a customer file. */
+    private static final String ADDRESS_FROM = "bc1qsenderaddresssenderaddresssenderaddr0";
+    private static final String ADDRESS_TO = "bc1qreceiveraddressreceiveraddressreceiv0";
 
     // ---------------------------------------------------------------------------------------------
     // header resolution
@@ -65,6 +82,27 @@ class SrajtofleBeanV1Test {
         assertEquals(
             SupportedExchange.SRAJTOFLE,
             EverytradeCsvMultiParser.DESCRIPTOR.getSupportedExchange(HEADER_COMMA_SEPARATED.strip())
+        );
+    }
+
+    /**
+     * ETD-2200: the same export also exists without the four trailing metadata columns. Before the
+     * 9-column template was registered this header matched nothing and the upload died with
+     * UnknownHeaderException.
+     */
+    @Test
+    void nineColumnHeaderResolvesToSrajtofle() {
+        assertEquals(
+            SupportedExchange.SRAJTOFLE,
+            EverytradeCsvMultiParser.DESCRIPTOR.getSupportedExchange(HEADER_9_COLUMNS.strip())
+        );
+    }
+
+    @Test
+    void nineColumnCommaSeparatedHeaderResolvesToSrajtofle() {
+        assertEquals(
+            SupportedExchange.SRAJTOFLE,
+            EverytradeCsvMultiParser.DESCRIPTOR.getSupportedExchange(HEADER_9_COLUMNS_COMMA_SEPARATED.strip())
         );
     }
 
@@ -307,5 +345,172 @@ class SrajtofleBeanV1Test {
 
         assertEquals(0, result.getTransactionClusters().size());
         assertEquals(1, result.getParsingProblems().size());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // 9-column variant (ETD-2200) -- no NOTE / LABELS / PARTNER / REFERENCE column
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    void nineColumnDepositRowIsParsed() {
+        final String row = "22;05.03.2025 11:22:33;BTC;DEPOSIT;0.00071350;0.00000771;BTC;"
+            + ADDRESS_FROM + ";" + ADDRESS_TO + "\n";
+        final var actual = ParserTestUtils.getTransactionClusters(HEADER_9_COLUMNS + row);
+
+        assertEquals(1, actual.size());
+        final var expected = new TransactionCluster(
+            ImportedTransactionBean.createDepositWithdrawal(
+                "22", Instant.parse("2025-03-05T11:22:33Z"), BTC, BTC, DEPOSIT,
+                new BigDecimal("0.00071350"), ADDRESS_FROM, null, null, null, null
+            ),
+            List.of(new FeeRebateImportedTransactionBean(
+                "22" + FEE_UID_PART, Instant.parse("2025-03-05T11:22:33Z"), BTC, BTC, FEE,
+                new BigDecimal("0.00000771"), BTC, null, ADDRESS_FROM, null, null, null
+            ))
+        );
+        ParserTestUtils.checkEqual(expected, actual.get(0));
+
+        final var tx = actual.get(0).getMain();
+        assertEquals(ADDRESS_FROM, tx.getAddress(), "a DEPOSIT is addressed by ADDRESS_FROM");
+        assertNull(tx.getNote(), "no NOTE column in the 9-column variant");
+        assertNull(tx.getLabels(), "no LABELS column in the 9-column variant");
+        assertNull(tx.getPartner(), "no PARTNER column in the 9-column variant");
+        assertNull(tx.getReference(), "no REFERENCE column in the 9-column variant");
+        assertNull(tx.getUnitPrice(), "this format carries no price at all");
+        assertNull(tx.getQuoteVolume(), "and no quote volume either");
+    }
+
+    @Test
+    void nineColumnWithdrawalRowIsParsed() {
+        final String row = "23;07.04.2025 08:09:10;BTC;WITHDRAWAL;0.00500000;0.00001234;BTC;"
+            + ADDRESS_FROM + ";" + ADDRESS_TO + "\n";
+        final var cluster = ParserTestUtils.getTransactionCluster(HEADER_9_COLUMNS + row);
+        final var tx = cluster.getMain();
+
+        assertEquals(WITHDRAWAL, tx.getAction());
+        assertEquals(BTC, tx.getBase());
+        assertEquals(BTC, tx.getQuote(), "a bare SYMBOL makes the quote fall back to the base");
+        assertEquals(0, new BigDecimal("0.005").compareTo(tx.getVolume()));
+        assertEquals(ADDRESS_TO, tx.getAddress(), "a WITHDRAWAL is addressed by ADDRESS_TO");
+        assertNull(tx.getNote());
+        assertNull(tx.getLabels());
+        assertNull(tx.getPartner());
+        assertNull(tx.getReference());
+        assertNull(tx.getQuoteVolume());
+    }
+
+    @Test
+    void nineColumnCommaSeparatedRowIsParsed() {
+        final String row = "24,09.05.2025 13:14:15,BTC,DEPOSIT,0.00002,0.00000286,BTC,"
+            + ADDRESS_FROM + "," + ADDRESS_TO + "\n";
+        final var cluster = ParserTestUtils.getTransactionCluster(HEADER_9_COLUMNS_COMMA_SEPARATED + row);
+
+        assertEquals(DEPOSIT, cluster.getMain().getAction());
+        assertEquals(0, new BigDecimal("0.00002").compareTo(cluster.getMain().getVolume()));
+        assertEquals(1, cluster.getRelated().size(), "the FEE column still produces its own fee leg");
+    }
+
+    /**
+     * 43 rows of the reported file carry a FEE larger than their QUANTITY and 7 carry one exactly
+     * equal to it. Whether that column really is this account's own cost is a question about the
+     * format, not about header matching, so ETD-2200 leaves the accounting untouched and this test
+     * only pins what the parser does today: the row is accepted and the fee leg is emitted at its
+     * face value.
+     */
+    @Test
+    void nineColumnWithdrawalWithFeeEqualToQuantityIsAccepted() {
+        final String row = "26;07.04.2025 08:09:10;BTC;WITHDRAWAL;0.00071350;0.00071350;BTC;"
+            + ADDRESS_FROM + ";" + ADDRESS_TO + "\n";
+        final var result = ParserTestUtils.getParseResult(HEADER_9_COLUMNS + row);
+
+        assertEquals(0, result.getParsingProblems().size());
+        assertEquals(1, result.getTransactionClusters().size());
+
+        final var cluster = result.getTransactionClusters().get(0);
+        assertEquals(0, new BigDecimal("0.00071350").compareTo(cluster.getMain().getVolume()));
+        assertEquals(1, cluster.getRelated().size());
+        assertEquals(
+            0,
+            new BigDecimal("0.00071350").compareTo(cluster.getRelated().get(0).getVolume()),
+            "the fee leg is as large as the withdrawal itself"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // addresses and header resolution of neighbouring widths
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Real exports leave ADDRESS_TO empty on some withdrawals - 9 of the 131 in the reported file,
+     * including its very first row. Univocity turns the empty trailing field into null and there is
+     * no fallback, so the main transaction ends up address-less. Pinned as today's behaviour:
+     * {@code EveryTradeBeanV3_2} does exactly the same for a WhaleBooks withdrawal, so changing it
+     * only here would split the two formats apart.
+     */
+    @Test
+    void nineColumnWithdrawalWithEmptyAddressToLeavesMainAddressNull() {
+        final String row = "32;11.06.2025 15:16:17;BTC;WITHDRAWAL;0.001;0.0000123;BTC;" + ADDRESS_FROM + ";\n";
+        final var cluster = ParserTestUtils.getTransactionCluster(HEADER_9_COLUMNS + row);
+
+        assertEquals(WITHDRAWAL, cluster.getMain().getAction());
+        assertNull(cluster.getMain().getAddress(), "ADDRESS_TO is empty and there is no fallback");
+        assertEquals(
+            ADDRESS_FROM,
+            cluster.getRelated().get(0).getAddress(),
+            "while the fee leg falls back to ADDRESS_FROM - pinned as today's behaviour"
+        );
+    }
+
+    /**
+     * The 9-column template must not outrank the 13-column one for a full Srajtofle export, and the
+     * pass-through columns must keep arriving.
+     */
+    @Test
+    void thirteenColumnRowStillKeepsItsMetadataColumns() {
+        final String row = "33;01.06.2025 00:00:00;BTC;DEPOSIT;1;;;from;to;a note;label1;ACME;ref-42\n";
+        final var tx = ParserTestUtils.getTransactionCluster(HEADER + row).getMain();
+
+        assertEquals("a note", tx.getNote());
+        assertEquals("label1", tx.getLabels());
+        assertEquals("ACME", tx.getPartner());
+        assertEquals("ref-42", tx.getReference());
+    }
+
+    /**
+     * ETD-2200: CsvHeader's ordered mode is a subsequence test, so an ORDERED 9-column template would
+     * also match every priced WhaleBooks header - UNIT_PRICE, VOLUME_QUOTE, REBATE and
+     * REBATE_CURRENCY all sit between QUANTITY and ADDRESS_FROM, and extra columns are tolerated.
+     * None of these widths is registered anywhere, so each is refused with UnknownHeaderException
+     * today; capturing them would hand them to SrajtofleBeanV1, which has no price setter, and the
+     * trade would import price-less with zero parsing problems - a silent loss of cost basis in a tax
+     * product. The 9-column template is registered unordered precisely to keep them refused.
+     */
+    @Test
+    void trimmedButPricedWhalebooksHeadersAreStillRefused() {
+        final List<String> pricedHeaders = List.of(
+            "UID;DATE;SYMBOL;ACTION;QUANTITY;UNIT_PRICE;VOLUME_QUOTE;FEE;FEE_CURRENCY;ADDRESS_FROM;ADDRESS_TO",
+            "UID;DATE;SYMBOL;ACTION;QUANTITY;UNIT_PRICE;FEE;FEE_CURRENCY;ADDRESS_FROM;ADDRESS_TO",
+            "UID;DATE;SYMBOL;ACTION;QUANTITY;UNIT_PRICE;VOLUME_QUOTE;FEE;FEE_CURRENCY;REBATE;REBATE_CURRENCY;"
+                + "ADDRESS_FROM;ADDRESS_TO",
+            "UID;DATE;SYMBOL;ACTION;QUANTITY;UNIT_PRICE;FEE;FEE_CURRENCY;REBATE;REBATE_CURRENCY;ADDRESS_FROM;ADDRESS_TO"
+        );
+
+        pricedHeaders.forEach(header -> assertFalse(
+            EverytradeCsvMultiParser.DESCRIPTOR.isHeaderSupported(header),
+            "a header carrying a price column must not be captured by the price-less Srajtofle template: " + header
+        ));
+    }
+
+    /**
+     * The flip side of the test above: unordered matching means the file header has to be built from
+     * the nine known names, but it does not have to carry all nine. A shorter price-less export is
+     * accepted rather than refused, and nothing is lost because there is no column to lose.
+     */
+    @Test
+    void aShorterPricelessHeaderBuiltFromTheSameNamesIsAccepted() {
+        assertEquals(
+            SupportedExchange.SRAJTOFLE,
+            EverytradeCsvMultiParser.DESCRIPTOR.getSupportedExchange("UID;DATE;SYMBOL;ACTION;QUANTITY;FEE;FEE_CURRENCY")
+        );
     }
 }

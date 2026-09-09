@@ -29,13 +29,22 @@ import static lombok.AccessLevel.PRIVATE;
 /**
  * Srajtofle CSV export. The format is the WhaleBooks transaction export minus the
  * {@code UNIT_PRICE} and {@code VOLUME_QUOTE} columns, because Srajtofle keeps no price or
- * quote-volume bookkeeping:
+ * quote-volume bookkeeping. Two widths are in circulation and this bean reads both:
  *
  * <pre>
- * UID;DATE;SYMBOL;ACTION;QUANTITY;FEE;FEE_CURRENCY;ADDRESS_FROM;ADDRESS_TO;NOTE;LABELS;PARTNER;REFERENCE
+ * 13 columns: UID;DATE;SYMBOL;ACTION;QUANTITY;FEE;FEE_CURRENCY;ADDRESS_FROM;ADDRESS_TO;NOTE;LABELS;PARTNER;REFERENCE
+ *  9 columns: UID;DATE;SYMBOL;ACTION;QUANTITY;FEE;FEE_CURRENCY;ADDRESS_FROM;ADDRESS_TO
  * </pre>
  *
- * <p>Consequences of the two missing columns:
+ * <p>The 9-column variant (ETD-2200) additionally drops the four trailing metadata columns.
+ * Strict header validation is not enabled on the univocity parser, so the setters for the absent
+ * columns are never called and {@code note}, {@code labels}, {@code partner} and {@code reference}
+ * simply stay {@code null} - which every code path here already tolerates. Both widths are
+ * registered as separate header templates against this one bean in
+ * {@code EverytradeCsvMultiParser}; the 9-column one has to be registered UNORDERED so that it
+ * cannot capture a priced WhaleBooks header, see the comment on that registration.
+ *
+ * <p>Consequences of the two missing price columns:
  * <ul>
  *   <li>Priceless transaction types (DEPOSIT, WITHDRAWAL, FEE, REBATE, STAKE, UNSTAKE,
  *       STAKING_REWARD, REWARD, EARNING, FORK, AIRDROP) behave exactly as in the WhaleBooks
