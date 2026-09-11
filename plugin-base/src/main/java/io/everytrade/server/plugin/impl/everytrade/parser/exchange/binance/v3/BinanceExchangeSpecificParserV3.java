@@ -17,13 +17,9 @@ import java.io.IOException;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import static io.everytrade.server.plugin.api.parser.ParsingProblemType.PARSED_ROW_IGNORED;
 import static io.everytrade.server.plugin.api.parser.ParsingProblemType.ROW_PARSING_FAILED;
@@ -35,9 +31,13 @@ public class BinanceExchangeSpecificParserV3 implements IExchangeSpecificParser 
     // start with a digit are not legal Java identifiers, so their enum name is prefixed with '_' and would never
     // match an exchange ticker. Resolution therefore always goes through code()/Currency.fromCode().
     private static final Set<String> CURRENCY_CODES = new HashSet<>();
-    // "1INCHUSDT" -> (1INCH, USDT). Concatenated base+quote codes cannot be split by a trailing-letters regex when the
-    // base starts with a digit, so the "Pair" column is resolved against this map first (see extractCurrencyFromEnd).
-    private static final Map<String, CurrencyPair> CURRENCY_PAIRS_BY_CONCAT = new HashMap<>();
+    // Binance's settlement assets, most-used first. Consulted ONLY to break a tie between two otherwise valid splits
+    // of a symbol whose amount columns carry no ticker; never a filter, so a pair quoted in anything else still
+    // resolves through the longest-base rule below.
+    private static final List<String> QUOTE_PREFERENCE = List.of(
+        "USDT", "FDUSD", "USDC", "BUSD", "TUSD", "BTC", "ETH", "BNB", "EUR", "TRY", "BRL", "GBP", "AUD", "JPY",
+        "RUB", "UAH", "ZAR", "NGN", "PLN", "RON", "ARS", "CZK", "DAI", "XRP", "DOGE", "TRX", "SOL", "DOT",
+        "IDRT", "BIDR", "BVND", "VAI", "PAX", "UST", "AEUR", "COP", "MXN");
 
     public BinanceExchangeSpecificParserV3(String delimiter) {
         this.delimiter = delimiter;
@@ -46,9 +46,6 @@ public class BinanceExchangeSpecificParserV3 implements IExchangeSpecificParser 
     static {
         for (Currency currency : Currency.values()) {
             CURRENCY_CODES.add(currency.code());
-        }
-        for (CurrencyPair pair : CurrencyPair.getTradeablePairs()) {
-            CURRENCY_PAIRS_BY_CONCAT.put(pair.getBase().code() + pair.getQuote().code(), pair);
         }
     }
 
@@ -126,19 +123,30 @@ public class BinanceExchangeSpecificParserV3 implements IExchangeSpecificParser 
     private BinanceBeanV3 parseExchangeBean(String[] vals) {
         String row = String.join(",", vals);
         try {
-            // Resolve the trading pair from the "Pair" column (vals[1], e.g. "1INCHUSDT") first. This is the only
-            // reliable split for tickers that start with a digit (1INCH, 1000SATS, ...): the amount columns glue the
-            // number and the ticker together with no separator ("5.11INCH"), which a trailing-letters regex parses as
-            // 5.11 + "INCH" instead of 5.1 + "1INCH".
-            CurrencyPair currencyPair = CURRENCY_PAIRS_BY_CONCAT.get(vals[1]);
-            if (currencyPair == null) {
-                // Unknown pair string: fall back to deriving base/quote from the trailing currency code of the amounts.
-                Currency baseCurrency = extractCurrencyFromEnd(vals[4]);
-                Currency quoteCurrency = extractCurrencyFromEnd(vals[5]);
-                if (baseCurrency == null || quoteCurrency == null) {
+            // Resolve the pair from the AMOUNT columns first (vals[4] "0.01964BTC", vals[5] "348.9898376BUSD"): the
+            // ticker glued to each number names its own side of the trade, so it is per-row evidence that cannot be
+            // ambiguous. The "Pair" column alone can be, and silently: base+quote concatenations collide, e.g.
+            // "BTCBUSD" is both BTC+BUSD and BTCB+USD (394 of the ~1.03M concatenations over the current Currency
+            // enum do this). Until ETS-5078 the pair string was looked up in a map built from
+            // CurrencyPair.getTradeablePairs(), where a collision simply kept whichever entry the HashSet iteration
+            // inserted last - and since Currency is an enum whose hashCode() is the identity hash, that order depends
+            // on JVM allocation history. Measured on this fixture: the same "BTCBUSD" resolved to BTCB/USD or to
+            // BTC/BUSD in the same build depending only on what had been class-loaded first, so one server restart
+            // could import the same file as a different asset.
+            //
+            // Longest-code-suffix matching is what makes the amount columns safe for digit-leading tickers too:
+            // "5.11INCH" ends with both "INCH" and "1INCH", and the longer one is the real ticker (5.1 of 1INCH).
+            Currency baseCurrency = extractCurrencyFromEndOrNull(vals[4]);
+            Currency quoteCurrency = extractCurrencyFromEndOrNull(vals[5]);
+            CurrencyPair currencyPair;
+            if (baseCurrency != null && quoteCurrency != null) {
+                currencyPair = new CurrencyPair(baseCurrency, quoteCurrency);
+            } else {
+                // The "Quantity"/"Amount" variant of this export carries bare numbers, so the symbol is all there is.
+                currencyPair = resolvePairFromSymbol(vals[1]);
+                if (currencyPair == null) {
                     throw new DataValidationException("Could not extract base or quote currency from values");
                 }
-                currencyPair = new CurrencyPair(baseCurrency, quoteCurrency);
             }
             // The fee can be paid in a third asset (typically BNB), so it is not part of the pair.
             Currency feeCurrency = extractCurrencyFromEndOrNull(vals[6]);
@@ -165,25 +173,73 @@ public class BinanceExchangeSpecificParserV3 implements IExchangeSpecificParser 
         return null;
     }
 
-    private Currency extractCurrencyFromEnd(String value) {
-        Pattern pattern = Pattern.compile("([A-Z]+)$");
-        Matcher matcher = pattern.matcher(value);
-        if (matcher.find()) {
-            String currencyCode = matcher.group(1);
-            if (CURRENCY_CODES.contains(currencyCode)) {
-                return Currency.fromCode(currencyCode);
-            } else {
-                throw new DataValidationException("Unsupported currency code: " + currencyCode);
-            }
-        } else {
-            throw new DataValidationException("Currency code not found in value: " + value);
+    /**
+     * Splits a concatenated Binance symbol such as {@code "1INCHUSDT"} into its two {@link Currency#code()} halves.
+     *
+     * <p>Used only when the amount columns carry bare numbers and the symbol is therefore the sole evidence. Every
+     * split point is tried, so a digit-leading base (1INCH, 1000SATS) is found exactly like any other; no precomputed
+     * map of concatenations is involved, because such a map cannot represent an ambiguous key and silently keeps one
+     * arbitrary winner.
+     *
+     * <p>When more than one split is valid, the QUOTE decides, and it is picked from {@link #QUOTE_PREFERENCE} -
+     * Binance's settlement assets, most-used first. That is how the exchange actually builds a symbol: the quote
+     * comes from a short list while the base is the long tail. "Longest quote wins" looks like the same rule and is
+     * not: it reads ETHWBTC as ETH/WBTC (really ETHW/BTC), NEXOUSD as NEX/OUSD (really NEXO/USD) and LUNAEUR as
+     * LUN/AEUR (really LUNA/EUR), because a longer ticker happens to end the symbol.
+     *
+     * <p>If no candidate is quoted in a settlement asset the LONGEST BASE wins, with the base code as the final
+     * alphabetical tie-break - arbitrary, but fixed, which is the whole point: the answer may never again depend on
+     * hash iteration order. A row whose amount columns name their own currencies never reaches any of this.
+     *
+     * @return the resolved pair, or {@code null} when no split yields two known currency codes
+     */
+    private static CurrencyPair resolvePairFromSymbol(String symbol) {
+        if (symbol == null || symbol.isBlank()) {
+            return null;
         }
+        String upper = symbol.trim().toUpperCase();
+        String bestBase = null;
+        String bestQuote = null;
+        int bestQuoteRank = Integer.MAX_VALUE;
+        for (int split = 1; split < upper.length(); split++) {
+            String base = upper.substring(0, split);
+            String quote = upper.substring(split);
+            if (!CURRENCY_CODES.contains(base) || !CURRENCY_CODES.contains(quote)) {
+                continue;
+            }
+            int rank = QUOTE_PREFERENCE.indexOf(quote);
+            if (rank < 0) {
+                rank = Integer.MAX_VALUE;
+            }
+            if (bestBase == null || betterThan(rank, base, bestQuoteRank, bestBase)) {
+                bestBase = base;
+                bestQuote = quote;
+                bestQuoteRank = rank;
+            }
+        }
+        return bestBase == null ? null : new CurrencyPair(Currency.fromCode(bestBase), Currency.fromCode(bestQuote));
+    }
+
+    /** A settlement-asset quote beats any other; among equals the longer base wins, then the alphabetically first. */
+    private static boolean betterThan(int rank, String base, int bestRank, String bestBase) {
+        if (rank != bestRank) {
+            return rank < bestRank;
+        }
+        if (base.length() != bestBase.length()) {
+            return base.length() > bestBase.length();
+        }
+        return base.compareTo(bestBase) < 0;
     }
 
     /**
      * Resolves the currency a value like "0.00010548BNB" ends with by the longest matching {@link Currency#code()}
      * suffix (longest wins so overlapping codes disambiguate). Returns {@code null} when nothing matches, which the
-     * bean treats as an unknown fee coin rather than failing the whole row.
+     * caller treats as "this column names no currency" - an unknown fee coin, or a bare number.
+     *
+     * <p>A code made only of digits is never matched here. There is exactly one ({@code 00}), and it would turn the
+     * trailing zeros of any bare amount into a currency: "0.02000000" ends with "00", so a Binance export whose
+     * quantity column carries no ticker would resolve to 00/00 instead of falling through to the symbol. A ticker
+     * glued to a number is only recognisable when it has at least one letter, so that is the requirement.
      */
     private static Currency extractCurrencyFromEndOrNull(String value) {
         if (value == null || value.isBlank()) {
@@ -193,10 +249,22 @@ public class BinanceExchangeSpecificParserV3 implements IExchangeSpecificParser 
         Currency best = null;
         for (Currency currency : Currency.values()) {
             String code = currency.code();
+            if (hasNoLetter(code)) {
+                continue;
+            }
             if (upper.endsWith(code) && (best == null || code.length() > best.code().length())) {
                 best = currency;
             }
         }
         return best;
+    }
+
+    private static boolean hasNoLetter(String code) {
+        for (int i = 0; i < code.length(); i++) {
+            if (Character.isLetter(code.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 }
