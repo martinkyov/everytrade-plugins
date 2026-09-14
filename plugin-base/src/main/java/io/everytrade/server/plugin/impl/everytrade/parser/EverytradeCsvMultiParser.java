@@ -1279,12 +1279,41 @@ public class EverytradeCsvMultiParser implements ICsvParser {
         /*
          * SRAJTOFLE
          *
-         * The WhaleBooks export header minus UNIT_PRICE and VOLUME_QUOTE. That makes this template a
-         * strict subset of the WhaleBooks one, and CsvHeader matching is subset-based -- so a real
-         * WhaleBooks file matches both templates. findCsvDetailByHeader() and
-         * ParserDescriptor.findHeaderTemplate() both resolve ties by the highest column count, so the
-         * 15-column WhaleBooks template still wins for WhaleBooks files and only a genuinely
-         * price-less 13-column file lands here.
+         * Two shapes of the same export, both served by SrajtofleBeanV1:
+         *
+         *   13 columns: UID;DATE;SYMBOL;ACTION;QUANTITY;FEE;FEE_CURRENCY;ADDRESS_FROM;ADDRESS_TO;
+         *               NOTE;LABELS;PARTNER;REFERENCE
+         *    9 columns: UID;DATE;SYMBOL;ACTION;QUANTITY;FEE;FEE_CURRENCY;ADDRESS_FROM;ADDRESS_TO
+         *
+         * The 13-column shape is the WhaleBooks export header minus UNIT_PRICE and VOLUME_QUOTE; the
+         * 9-column one drops the four trailing metadata columns as well (ETD-2200). Univocity does not
+         * enable strict header validation, so the same bean reads both - the setters for the absent
+         * columns are simply never called and note/labels/partner/reference stay null.
+         *
+         * The two templates need OPPOSITE matching modes, which is why only one of them is built with
+         * CsvHeader.of():
+         *
+         *  - The 13-column one is ORDERED, i.e. every template column must appear in the file header,
+         *    in order, and extra file columns are tolerated. A real 15-column WhaleBooks file therefore
+         *    matches it as well, but findCsvDetailByHeader() and ParserDescriptor.findHeaderTemplate()
+         *    both resolve ties by the highest column count, so the 15-column WhaleBooks template wins.
+         *
+         *  - The 9-column one is UNORDERED, which in CsvHeader means the reverse containment: every
+         *    FILE column must be one of the template's nine names. Ordered matching would be wrong
+         *    here, because these nine names are also an ordered subsequence of every priced WhaleBooks
+         *    header (UNIT_PRICE and VOLUME_QUOTE sit between QUANTITY and FEE). A hand-trimmed
+         *    WhaleBooks export such as
+         *      UID;DATE;SYMBOL;ACTION;QUANTITY;UNIT_PRICE;VOLUME_QUOTE;FEE;FEE_CURRENCY;
+         *      ADDRESS_FROM;ADDRESS_TO
+         *    matches no registered template at all today and is refused with UnknownHeaderException;
+         *    an ordered 9-column template would capture it and hand it to SrajtofleBeanV1, which has no
+         *    UNIT_PRICE or VOLUME_QUOTE setter - so the trade would import price-less, with zero
+         *    parsing problems, and the user would silently lose the cost basis. Unordered matching
+         *    rejects it again, because UNIT_PRICE is not one of the nine names.
+         *
+         * The widening is therefore limited to headers built purely from these nine names, none of
+         * which carries a price. Verified against all 119 registered templates: not one has a column
+         * set contained in these nine, so no file that resolves today can be taken over by this entry.
          */
         DELIMITERS.forEach(delimiter -> {
             EXCHANGE_PARSE_DETAILS.add(ExchangeParseDetail.builder()
@@ -1292,7 +1321,15 @@ public class EverytradeCsvMultiParser implements ICsvParser {
                     CsvHeader.of(
                         "UID", "DATE", "SYMBOL", "ACTION", "QUANTITY", "FEE", "FEE_CURRENCY",
                         "ADDRESS_FROM", "ADDRESS_TO", "NOTE", "LABELS", "PARTNER", "REFERENCE"
-                    ).withSeparator(delimiter)))
+                    ).withSeparator(delimiter),
+                    new CsvHeader(
+                        List.of(
+                            "UID", "DATE", "SYMBOL", "ACTION", "QUANTITY", "FEE", "FEE_CURRENCY",
+                            "ADDRESS_FROM", "ADDRESS_TO"
+                        ),
+                        delimiter,
+                        false
+                    )))
                 .parserFactory(() -> new DefaultUnivocityExchangeSpecificParser(SrajtofleBeanV1.class, delimiter))
                 .supportedExchange(SRAJTOFLE)
                 .build());

@@ -146,6 +146,61 @@ class BinanceBeanV3Test {
         ParserTestUtils.checkEqual(expected, actual);
     }
 
+    /**
+     * ETS-5078: "BTCBUSD" is BTC+BUSD, but it is ALSO BTCB+USD, and the parser used to resolve the symbol through a
+     * precomputed map of every base+quote concatenation. A map cannot hold two values for one key, so the collision
+     * kept whichever entry the HashSet iteration inserted last - and {@code Currency} is an enum whose
+     * {@code hashCode()} is the identity hash, so that order follows JVM allocation history rather than anything
+     * about the data. The same file therefore imported as BTC/BUSD or as BTCB/USD depending only on what had been
+     * class-loaded first: measured both ways in one build, which means a server restart could silently change which
+     * asset a customer's trade belongs to. 394 of the ~1.03M concatenations over the current enum are ambiguous
+     * this way; BTCBUSD is simply the one a customer traded.
+     *
+     * <p>The row carries the answer with it: "Provedeno"/"Executed" and "Castka"/"Amount" glue each amount to its own
+     * ticker, so the pair is now read from there and the symbol is only consulted when those columns are bare.
+     *
+     * <p>Values are synthetic - the shape is the customer's, the numbers are not.
+     */
+    @Test
+    void testAmbiguousConcatenatedSymbolIsResolvedFromTheAmountColumns() {
+        final String header = "\uFEFFČas,Pár,Strana,Cena,Provedeno,Částka,Poplatek\n";
+        final String row0 = "2022-11-08 19:36:00,BTCBUSD,SELL,17000,0.02000000BTC,340.00000000BUSD,0BNB\n";
+
+        final TransactionCluster actual = ParserTestUtils.getTransactionCluster(header + row0);
+
+        final TransactionCluster expected = new TransactionCluster(
+            new ImportedTransactionBean(
+                null,
+                Instant.parse("2022-11-08T19:36:00Z"),
+                BTC,
+                BUSD,
+                SELL,
+                new BigDecimal("0.02000000000000000"),
+                new BigDecimal("17000.00000000000000000")
+            ),
+            List.of()
+        );
+        ParserTestUtils.checkEqual(expected, actual);
+    }
+
+    /**
+     * The other half of the same fix. The "Quantity" variant of this export carries bare numbers, so the amount
+     * columns name no currency and the symbol is all there is. Splitting it is then unavoidable, and the tie-break
+     * has to be deterministic rather than whatever a hash map happened to keep: the LONGEST quote wins, which is how
+     * Binance actually builds a symbol - the quote comes from a small set of settlement assets while the base is the
+     * long tail. Without that rule this row is equally readable as BTCB/USD.
+     */
+    @Test
+    void testAmbiguousConcatenatedSymbolWithBareAmountsPrefersTheLongerQuote() {
+        final String header = "\uFEFFDate(UTC),Pair,Side,Price,Quantity,Amount,Fee\n";
+        final String row0 = "2022-11-08 19:36:00,BTCBUSD,SELL,17000,0.02000000,340.00000000,0\n";
+
+        final TransactionCluster actual = ParserTestUtils.getTransactionCluster(header + row0);
+
+        assertEquals(BTC, actual.getMain().getBase());
+        assertEquals(BUSD, actual.getMain().getQuote());
+    }
+
     @Test
     void testDigitLeadingTickerFromClientCsv() {
         // ETS-5077: Binance glues amount+ticker with no separator ("5.11INCH" = 5.1 of 1INCH). A digit-leading ticker
